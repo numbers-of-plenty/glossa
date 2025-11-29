@@ -22,6 +22,12 @@ def parse_args():
         default="config.yaml",
         help="Path to config YAML file (default: config.yaml)",
     )
+
+    parser.add_argument(
+        "--skip_language",
+        action="store_true",
+        help="Skip spanification + Spanish sentence + audio generation (default: False)",
+    )
     parser.add_argument(
         "--runs",
         type=int,
@@ -58,7 +64,7 @@ async def fetch_agent_news(agent_name: str) -> str:
         tools=[{"type": "web_search"}],
         reasoning={"effort": "low"},
         input=prompt,
-        max_output_tokens=10000,
+        max_output_tokens=20000,
     )
     return f"--- {agent_name} ---\n" + response.output_text
 
@@ -82,7 +88,7 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
     
     FILTERING RULES:
 
-    1. All events which can be visited in the future get a free pass. Others are subject to filtering.
+    1. All events which can be visited in the future get a free pass (should be 100% kept). Others are subject to filtering.
     2. Discard any news items that do NOT have any kind of a link/url (or at least refernce)
 
     PRIORITY RULES:
@@ -91,8 +97,9 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
     5. Give medium priority to the news without explicit date but which are likely recent.
     6. Give the low priority to the news which explicitly are older than 7 days. 
     7. Give the low priority to the local events which already ended in the previous days.
-    8. Prioritize the most impactful news item if several news items have same link / source website. Give lower priority to the other such news items.
-    9. If several news items cover the same event, prioritize the one with the most complete summary, give the lowest priority to others covering the same event.
+    8. If several news items have the same link / source website, choose just the one news item and give low priority to all the other news items with the same link/source.
+    9. If several news items cover the same event/news, keep just one and give absolutely the lowest priority to all the other news item covering the same event.
+    10. All events which can be visited in person in the future get the high priority. 
 
     
     SELECTION RULES:
@@ -146,7 +153,7 @@ async def spanify_news(curated_news_path: str, output_path: str) -> str:
     You are given curated news items. Transform them by replacing EXACTLY ONE word per news item with its Spanish equivalent.
     
     REPLACEMENT RULES:
-    1. In EACH news item, replace exactly one word with its Spanish translation
+    1. In EACH news item, replace exactly one word with its Spanish translation but NOT in the headline
     2. Use the most basic form: nominative/singular for nouns, infinitive for verbs
     3. Immediately after the Spanish word, add its IPA transliteration in square brackets
     4. Vary the types of words replaced (nouns, verbs, adjectives, etc.)
@@ -264,6 +271,12 @@ async def main():
 
     curated_news = await curate_news(raw_news_path, "news_curated.txt")
     # print(curated_news)
+
+    # flag to avoid language learning steps
+    if args.skip_language:
+        print("Language processing disabled (--language False).")
+        print("Generated: news_raw.txt and news_curated.txt")
+        return
 
     print("\n" + "=" * 50)
     print("Spanifying news...")
