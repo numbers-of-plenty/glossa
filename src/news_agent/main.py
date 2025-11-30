@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from typing import List, Optional
 import json
 import pandas as pd
+import re
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -41,24 +42,41 @@ def parse_args():
     return parser.parse_args()
 
 
-async def fetch_agent_news(agent_name: str) -> str:
+async def single_agent_news(agent_name: str) -> str:
     topics = config["agents"][agent_name]["topics"]
     topics_str = "\n".join(f"- {t}" for t in topics)
 
     prompt = f"""
     Search the web. Focus heavily on the info published in the last 72 hours (3 days) but not limit the search to it. Today is
-    {datetime.datetime.now().strftime("%Y-%m-%d")}.
+    {datetime.datetime.now().strftime("%Y-%m-%d")}. The days that satisfy the "last 3 days" request are:
+    - { (datetime.datetime.now() - datetime.timedelta(days=0)).strftime("%Y-%m-%d") }
+    - { (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d") }
+    - { (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d") }
+    - { (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d") }
     
     Fetch information for the following topics:
     {topics_str}
 
     Return up to 10 items per topic.
-    Each item should have:
-    - headline
+    Each item should be formatted as below with <START>,<END> and <PRIORITY>,</PRIORITY> strictly included for subsequent parsing. Strictly only one news should be included per start-end block.:
+    <START>
+    ### headline
     - 2-4 sentence summary
-    - publication date (must be inside the last 72 hours) 
+    - publication date YYYY-MM-DD format or approximate YYYY-MM if exact date unknown
     - OR the date of the most recent event described on the website if the publication date is not available (must be inside the last 72 hours or in the future).
-    - link (Return actual URLs, not only reference IDs.)
+    - single link (Ensure to return the actual URLs, not only reference IDs.)
+    <PRIORITY>numeric_value</PRIORITY>
+    <END>
+
+        PRIORITY RULES (must use only integer values):
+    4 - Future events one could attend
+    3 - Publication explitely from the last 3 days
+    2 - Date unknown but possibly within last 3 days
+    1 - Older than 3 days but still recent
+    1 - News come from the same website/source as a higher priority news item
+    0 - Happened months ago or already ended live events
+    0 - The news without any link/url/reference
+    0 - Duplicate news covering the same event as another higher priority news item
 
     Do not ask me for any confirmations or permissions, search outright.
     """
@@ -66,86 +84,65 @@ async def fetch_agent_news(agent_name: str) -> str:
     response = await client.responses.create(
         model="gpt-5-nano",
         tools=[{"type": "web_search"}],
-        reasoning={"effort": "low"},
+        reasoning={"effort": "small"},
         input=prompt,
         max_output_tokens=20000,
     )
     return f"--- {agent_name} ---\n" + response.output_text
 
 
+async def all_agents_fetch_news():
+    tasks = []
+    for _ in range(runs):  # 2 synchronous runs per agent by default
+        for agent in config["agents"].keys():
+            tasks.append(single_agent_news(agent))
 
-class NewsItem(BaseModel):
-    full_text: str
+    all_results = await asyncio.gather(*tasks)
+    raw_news = "\n\n".join(all_results)
+    # print(final_output)
 
-class NewsItemsResponse(BaseModel):
-    items: List[NewsItem]
-
-
-
+    raw_news_path = "news_raw.txt"
+    with open(raw_news_path, "w", encoding="utf-8") as f:
+        f.write(raw_news)
+    
+    return raw_news
 
 async def split_raw_news(raw_news_path: str, chunks_json_path: str):
     """
-    Split RAW news text (as retrieved from each agent's GPT search) into structured JSON items.
-    Each item will contain: agent, topic, headline, summary, date, link, full_text.
+    Split RAW news text into structured JSON items, extracting:
+    - full_text (everything between <START> and <END>)
+    - priority (integer from <PRIORITY> tag)
     """
 
     with open(raw_news_path, "r", encoding="utf-8") as f:
         raw_news = f.read()
 
-    prompt = f"""
-    You are a text parsing assistant.
+    # Regex for each news block
+    news_pattern = re.compile(r"<START>(.*?)<END>", re.DOTALL | re.IGNORECASE)
+    news_blocks = news_pattern.findall(raw_news)
 
-    INPUT:
-    This is RAW output from several news-fetching agents. It contains:
-    - agent headers like '--- agent_1 ---'
-    - arbitrary comments and filler text
-    - topic sections
-    - bullet-style news items:
-        - Headline: ...
-          - Summary: ...
-          - Publication date: ...
-          - Link: ...
-          (sometimes with 'Source note:' or other extra fields)
+    items = []
+    for block in news_blocks:
+        block_clean = block.strip()
+        prio_match = re.search(r"<PRIORITY>(\d+)</PRIORITY>", block_clean, re.IGNORECASE)
+        priority = int(prio_match.group(1)) if prio_match else 0
+        # Remove priority tag from full_text
+        full_text_clean = re.sub(r"<PRIORITY>\d+</PRIORITY>", "", block_clean, flags=re.IGNORECASE).strip()
 
-    TASK:
-    Extract ONLY real news items.
-
-    For each extracted item, determine:
-    - "headline": string
-    - "summary": string
-    - "date": publication date as string exactly as given
-    - "link": URL
-    - "full_text": concatenate headline + summary + date + link into one text block
-
-    OUTPUT FORMAT (STRICT JSON):
-    {{
-      "items": [
-        {{
-          "full_text": "..."
-        }},
-        ...
-      ]
-    }}
-
-    NOTES:
-    - Ignore all filler narrative text not belonging to a news item.
-    - Do not include commentary. Return JSON only.
-
-    RAW NEWS:
-    {raw_news}
-    """
-
-    response = await client.responses.parse(
-        model="gpt-5-nano",
-        input=prompt,
-        text_format = NewsItemsResponse,
-        max_output_tokens=50000,
-    )
+        items.append({
+            "full_text": full_text_clean,
+            "priority": priority
+        })
 
     with open(chunks_json_path, "w", encoding="utf-8") as f:
-        f.write(response.output_text)
+        json.dump({"items": items}, f, ensure_ascii=False, indent=2)
 
-    return response
+    # legacy compatibility
+    class DummyResponse:
+        output_parsed = {"items": items}
+
+    return DummyResponse()
+
 
 async def embed_sentences(sentences):
     
@@ -304,9 +301,9 @@ async def make_spanish_sentence(spanified_path: str, sentence_txt: str) -> str:
 
     TASKS:
     1. Extract all UNIQUE Spanish words
-    2. Using ALL of these words, create the SHORTEST POSSIBLE Spanish text
-       that is still grammatical and meaningful. Do not reuse news content.
-    3. Return ONLY the sentence, without any additional commentary.
+    2. Using ALL of these words, create the SHORT Spanish text
+       that is still grammatical and makes sense. Do not reuse news content.
+    3. Return ONLY the text, without any additional commentary.
 
 
     INPUT:
@@ -357,19 +354,12 @@ async def generate_audio(sentence: str, audio_path: str):
 
 
 async def main():
-    tasks = []
-    for _ in range(runs):  # 2 synchronous runs per agent by default
-        for agent in config["agents"].keys():
-            tasks.append(fetch_agent_news(agent))
 
+    print("\n" + "=" * 50)
     print("Fetching news according to topics in the config")
-    all_results = await asyncio.gather(*tasks)
-    raw_news = "\n\n".join(all_results)
-    # print(final_output)
+    print("=" * 50 + "\n")
 
-    raw_news_path = "news_raw.txt"
-    with open(raw_news_path, "w", encoding="utf-8") as f:
-        f.write(raw_news)
+    raw_news = await all_agents_fetch_news()
 
     print("\n" + "=" * 50)
     print("Splitting RAW news into structured chunks...")
