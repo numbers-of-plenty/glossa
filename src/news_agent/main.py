@@ -6,6 +6,10 @@ import yaml
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import argparse
+from pydantic import BaseModel, Field, HttpUrl
+from typing import List, Optional
+import json
+import pandas as pd
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -69,6 +73,108 @@ async def fetch_agent_news(agent_name: str) -> str:
     return f"--- {agent_name} ---\n" + response.output_text
 
 
+
+class NewsItem(BaseModel):
+    full_text: str
+
+class NewsItemsResponse(BaseModel):
+    items: List[NewsItem]
+
+
+
+
+async def split_raw_news(raw_news_path: str, chunks_json_path: str):
+    """
+    Split RAW news text (as retrieved from each agent's GPT search) into structured JSON items.
+    Each item will contain: agent, topic, headline, summary, date, link, full_text.
+    """
+
+    with open(raw_news_path, "r", encoding="utf-8") as f:
+        raw_news = f.read()
+
+    prompt = f"""
+    You are a text parsing assistant.
+
+    INPUT:
+    This is RAW output from several news-fetching agents. It contains:
+    - agent headers like '--- agent_1 ---'
+    - arbitrary comments and filler text
+    - topic sections
+    - bullet-style news items:
+        - Headline: ...
+          - Summary: ...
+          - Publication date: ...
+          - Link: ...
+          (sometimes with 'Source note:' or other extra fields)
+
+    TASK:
+    Extract ONLY real news items.
+
+    For each extracted item, determine:
+    - "headline": string
+    - "summary": string
+    - "date": publication date as string exactly as given
+    - "link": URL
+    - "full_text": concatenate headline + summary + date + link into one text block
+
+    OUTPUT FORMAT (STRICT JSON):
+    {{
+      "items": [
+        {{
+          "full_text": "..."
+        }},
+        ...
+      ]
+    }}
+
+    NOTES:
+    - Ignore all filler narrative text not belonging to a news item.
+    - Do not include commentary. Return JSON only.
+
+    RAW NEWS:
+    {raw_news}
+    """
+
+    response = await client.responses.parse(
+        model="gpt-5-nano",
+        input=prompt,
+        text_format = NewsItemsResponse,
+        max_output_tokens=50000,
+    )
+
+    with open(chunks_json_path, "w", encoding="utf-8") as f:
+        f.write(response.output_text)
+
+    return response
+
+async def embed_sentences(sentences):
+    
+    response = await client.embeddings.create(
+        model="text-embedding-3-small",
+        input=sentences,
+    )
+
+    return sentences, response.data[0].embedding
+    
+
+async def embed_texts(news_texts):
+    
+    tasks = []
+    for sentences in news_texts:
+        tasks.append(embed_sentences(sentences))
+
+    results = await asyncio.gather(*tasks)
+
+    sentences, embeddings = zip(*results)
+    # Create DataFrame: index = sentence, column = embedding vector
+    embeddings_df = pd.DataFrame({
+        "embedding": embeddings
+    }, index=sentences)
+
+    embeddings_df.to_csv('news_embeddings.tsv', sep = '\t')
+    return embeddings_df
+
+
 async def curate_news(raw_news_path: str, output_path: str) -> str:
     """
     Process raw news data to create a curated list of top 11 impactful news items.
@@ -97,8 +203,8 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
     5. Give medium priority to the news without explicit date but which are likely recent.
     6. Give the low priority to the news which explicitly are older than 7 days. 
     7. Give the low priority to the local events which already ended in the previous days.
-    8. If several news items have the same link / source website, choose just the one news item and give low priority to all the other news items with the same link/source.
-    9. If several news items cover the same event/news, keep just one and give absolutely the lowest priority to all the other news item covering the same event.
+    8. If several news items have the same link / source website, choose just one of them to give it a higher priority and give low priority to all the other news items with the same link/source.
+    9. If several news items cover the same event/news, give just one of them a higher priority and give the lowest priority to all the other news item covering the same event.
     10. All events which can be visited in person in the future get the high priority. 
 
     
@@ -153,7 +259,7 @@ async def spanify_news(curated_news_path: str, output_path: str) -> str:
     You are given curated news items. Transform them by replacing EXACTLY ONE word per news item with its Spanish equivalent.
     
     REPLACEMENT RULES:
-    1. In EACH news item, replace exactly one word with its Spanish translation but NOT in the headline
+    1. In EACH news item, replace exactly one word in the summary with its Spanish translation but NOT in the headline
     2. Use the most basic form: nominative/singular for nouns, infinitive for verbs
     3. Immediately after the Spanish word, add its IPA transliteration in square brackets
     4. Vary the types of words replaced (nouns, verbs, adjectives, etc.)
@@ -264,6 +370,25 @@ async def main():
     raw_news_path = "news_raw.txt"
     with open(raw_news_path, "w", encoding="utf-8") as f:
         f.write(raw_news)
+
+    print("\n" + "=" * 50)
+    print("Splitting RAW news into structured chunks...")
+    print("=" * 50 + "\n")
+
+    raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
+    list_of_news = raw_chunks.output_parsed
+
+    print("\n" + "=" * 50)
+    print('projecting news items into embeddings...')
+    print("=" * 50 + "\n")
+    # news_texts = [item["text"] for item in list_of_news]
+
+    with open('news_raw_separate_items.json', 'r', encoding='utf-8') as f:
+        news_texts = json.load(f)
+    news_texts = news_texts['items']
+    news_texts = [text['full_text'] for text in news_texts]
+
+    embeddings = await embed_sentences(news_texts)
 
     print("\n" + "=" * 50)
     print("Curating news...")
