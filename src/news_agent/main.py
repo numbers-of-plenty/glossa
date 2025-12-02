@@ -46,8 +46,7 @@ def parse_args():
     return parser.parse_args()
 
 
-async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: str = "") -> str:
-    topics = config["agents"][agent_name]["topics"]
+async def single_agent_news(agent_name: str, topics: List[str], iteration: int = 1, previous_news: str = "") -> str:
     topics_str = "\n".join(f"- {t}" for t in topics)
 
     iteration_note = ""
@@ -160,20 +159,34 @@ async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: 
 #     return f"--- {agent_name} ---\n" + response.output_text
 
 
-async def all_agents_fetch_news():
+async def all_agents_fetch_news(config):
     agent_files = {}
 
     # First iteration
-    for agent in config["agents"].keys():
-        file1 = await single_agent_news(agent, iteration=1)
-        agent_files.setdefault(agent, []).append(file1)
+    first_iteration_tasks = []
+    agent_names = []
+    for agent_name, agent_data in config["agents"].items():
+        agent_names.append(agent_name)
+        topics = agent_data["topics"]
+        first_iteration_tasks.append(single_agent_news(agent_name, topics, iteration=1))
+    
+    first_iteration_files = await asyncio.gather(*first_iteration_tasks)
+    
+    for agent_name, file1 in zip(agent_names, first_iteration_files):
+        agent_files[agent_name] = [file1]
 
     # Second iteration
-    for agent in config["agents"].keys():
-        with open(agent_files[agent][0], "r", encoding="utf-8") as f:
+    second_iteration_tasks = []
+    for agent_name in agent_names:
+        with open(agent_files[agent_name][0], "r", encoding="utf-8") as f:
             previous_news = f.read()
-        file2 = await single_agent_news(agent, iteration=2, previous_news=previous_news)
-        agent_files[agent].append(file2)
+        topics = config["agents"][agent_name]["topics"]
+        second_iteration_tasks.append(single_agent_news(agent_name, topics, iteration=2, previous_news=previous_news))
+    
+    second_iteration_files = await asyncio.gather(*second_iteration_tasks)
+    
+    for agent_name, file2 in zip(agent_names, second_iteration_files):
+        agent_files[agent_name].append(file2)
 
     # Concatenate all agent files into one raw news file
     all_results = []
@@ -607,14 +620,14 @@ def print_section(message):
 async def main():
 
     print_section("Fetching news according to topics in the config")
-    raw_news_path, agent_files = await all_agents_fetch_news()
+    raw_news_path, agent_files = await all_agents_fetch_news(config)
 
     print_section("Splitting RAW news into structured chunks...")
     raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
     list_of_news = raw_chunks.output_parsed
 
     print_section("Selecting 40 news with highest priority")
-    top_news = await shuffle_sort_news(list_of_news, 10)
+    top_news = await shuffle_sort_news(list_of_news, 40)
 
     print_section('projecting news items into embeddings...')
     fresh_news, embeddings = await remove_duplicates(top_news)
@@ -622,27 +635,27 @@ async def main():
     print_section('Writing embeddings to ChromaDB...')
     await write_text_vectors(fresh_news, embeddings)
 
-    print_section("Curating news...")
-    curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
+    # print_section("Curating news...")
+    # curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
 
-    # flag to avoid language learning steps
-    if args.skip_language:
-        print("Language processing disabled (--language False).")
-        print("Generated: news_raw.txt and news_curated.txt")
-        return
+    # # flag to avoid language learning steps
+    # if args.skip_language:
+    #     print("Language processing disabled (--language False).")
+    #     print("Generated: news_raw.txt and news_curated.txt")
+    #     return
 
-    print_section("Spanifying news...")
-    spanified_news = await spanify_news("news_curated.txt", "news_spanified.txt")
-    # print(spanified_news)
+    # print_section("Spanifying news...")
+    # spanified_news = await spanify_news("news_curated.txt", "news_spanified.txt")
+    # # print(spanified_news)
 
-    print_section("Creating Spanish vocabulary sentence...")
-    sentence = await make_spanish_sentence("news_spanified.txt", "spanish_sentence.txt")
+    # print_section("Creating Spanish vocabulary sentence...")
+    # sentence = await make_spanish_sentence("news_spanified.txt", "spanish_sentence.txt")
 
-    print_section("Generating audio...")
-    await generate_audio(sentence, "spanish_sentence.mp3")
+    # print_section("Generating audio...")
+    # await generate_audio(sentence, "spanish_sentence.mp3")
 
-    print("Sentence saved to spanish_sentence.txt")
-    print("Audio saved to spanish_sentence.mp3")
+    # print("Sentence saved to spanish_sentence.txt")
+    # print("Audio saved to spanish_sentence.mp3")
 
     print("\nfinished!")
 
