@@ -9,22 +9,22 @@ from pydantic import BaseModel
 from typing import List
 import json
 from datetime import datetime, timedelta
-import nltk
-from nltk.stem import SnowballStemmer
+# import nltk
+# from nltk.stem import SnowballStemmer
 # import chromadb
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-number_of_news = 11
+target_words = 5
 
 target_language = "Spanish"
 DICTIONARY_FILE = "word_dictionary.json"
 
 # Download NLTK data for Spanish lemmatization
-try:
-    nltk.data.find('stemmers/snowball')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+# try:
+#     nltk.data.find('stemmers/snowball')
+# except LookupError:
+#     nltk.download('punkt', quiet=True)
 
 
 def parse_args():
@@ -92,7 +92,7 @@ async def get_words_to_avoid() -> List[str]:
     
     return words_to_avoid
 
-async def spanify_news(curated_news_path: str, output_path: str) -> str:
+async def translate_news(curated_news_path: str, output_path: str, config: dict) -> str:
     """
     Process the text to replace several words in it with the target language,
     add IPA transliteration, and include explanations.
@@ -100,22 +100,29 @@ async def spanify_news(curated_news_path: str, output_path: str) -> str:
     with open(curated_news_path, "r", encoding="utf-8") as f:
         curated_news = f.read()
 
+    target_words = config.get("words", 5)
+
     prompt = f"""
-    You are given a document. Replace several words in the document with their {target_language} translations, aim for 10 such words scattered across the entire document.
+    You are given a document. Replace several words in the document with their {target_language} translations, aim for {target_words} such words scattered across the entire document.
     
     REPLACEMENT RULES:
     #TODO
-    0. Words should not be from the list of words to avoid.
-    1. Words should be spread evenly across the document, not clustered together. Avoid replacing multiple words in the same sentence or adjacent sentences or a paragraph or a block of the text.
-    2. In the source text replace exactly 10 different words with their {target_language} equivalents
-    3. Use the most basic form: nominative/singular for nouns, infinitive for verbs
-    4. Immediately after the {target_language} word, add its IPA transliteration in square brackets
-    5. Vary the types of words replaced (nouns, verbs, adjectives, etc.)
-
-    
-    In the end of the text add the vocabulary for the words that were just replaced. It should include the word, its IPA transliteration, English sentence defining the word and the English translation itself. E.G.
-    **Vocabulary:**
-    - **[Gatto]** /[ˈɡat.to]/ - [A fluffy, relatively small predator which is popular as a pet. Cat.]
+    1. Words should not be from the list of words to avoid.
+    2. Words should be spread evenly across the document, not clustered together. Avoid replacing multiple words in the same sentence or adjacent sentences or a paragraph or a block of the text.
+    3. In the source text replace exactly 10 different words with their {target_language} equivalents
+    4. Vary the types of words replaced (nouns, verbs, adjectives, etc.)
+    5. Use the most basic form: nominative/singular for nouns, infinitive for verbs
+    6. Immediately after the {target_language} word, add its IPA transliteration in square brackets.
+    7. Add a mini-glossary explaining the meaning of each replaced word in English. It includes:
+        - First, the {target_language} word
+        - Then, its IPA transliteration
+        - then, a short English sentence defining the word without the word itself
+        - Finally, the direct English translation as a single word
+        e.g.:
+        **Vocabulary:**
+        - **[Gatto]** /[ˈɡat.to]/ - [A fluffy small predator which is popular as a pet. Cat.]
+        - **[Correre]** /[korˈre.re]/ - [Moving fast with both feets in the air. To run.]
+    8. Format the output as html file where the glossary is on the right in a separate box for the ease of reading. Make it visually appealing.
     ---
     
     SOURCE TEXT:
@@ -123,14 +130,15 @@ async def spanify_news(curated_news_path: str, output_path: str) -> str:
 
     List of words to avoid: {await get_words_to_avoid()}
     
-    Provide the transformed text with {target_language} word replacements, IPA transliterations in square brackets immediately after each {target_language} word, and vocabulary explanations at hteb end of the text. Do NOT include any additional commentary.
+    Provide the transformed text with {target_language} word replacements, IPA transliterations in square brackets immediately after each {target_language} word, and vocabulary explanations on the right side of the html file. Absolutely NONE additional commentaries, output should be ready to be written into .html.
     """
 
     response = await client.responses.create(
-        model="gpt-5-nano",
+        model="gpt-5-mini",
         reasoning={"effort": "medium"},
         input=prompt,
         max_output_tokens=40000,
+        #TODO let it search transliteration rules if needed
     )
 
     spanified_news = response.output_text
@@ -213,7 +221,7 @@ async def update_dictionary(words: List[str]) -> None:
         json.dump(dictionary, f, ensure_ascii=False, indent=2)
 
 
-async def make_spanish_sentence(
+async def make_target_language_sentence(
     target_language_words: List[str], sentence_txt: str
 ) -> str:
     """,
@@ -225,8 +233,9 @@ async def make_spanish_sentence(
     You are given a few words from the {target_language} language. 
 
     TASKS:
-    2. Using ALL of these words, create the SHORT {target_language} text
+    1. Using ALL of these words, create the SHORT {target_language} text
        that is still grammatical and makes sense.
+    2. Avoid ":" and ";" in the sentence. Make it more like a person speaks.
     3. Return ONLY the text, without any additional commentary.
 
 
@@ -275,13 +284,12 @@ def print_section(message):
 
 
 async def main(input_file: str = "input.txt"):
-    print_section("Spanifying news...")
-    spanified_news = await spanify_news(input_file, "news_spanified.txt")
-    # print(spanified_news)
+    print_section(f"Adding {target_language}")
+    translated_news = await translate_news(input_file, "news_translated.html", config)
+    # print(translated_news)
 
-    print_section("Extracting Spanish words...")
-    target_language_words = await extract_words(spanified_news)
-
+    print_section(f"Extracting {target_language} words...")
+    target_language_words = await extract_words(translated_news)
     # print_section("Lemmatizing Spanish words...")
     # lemmatized_words = await lemmatize_words(target_language_words)
     # print(f"Lemmatized words: {lemmatized_words}")
@@ -290,7 +298,7 @@ async def main(input_file: str = "input.txt"):
     await update_dictionary(target_language_words)
 
     print_section("Creating Spanish vocabulary sentence...")
-    sentence = await make_spanish_sentence(
+    sentence = await make_target_language_sentence(
         target_language_words, f"{target_language}_sentence.txt"
     )
 
